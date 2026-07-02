@@ -31,7 +31,21 @@ cargo install --path .
 
 ## Configuration
 
-Create a configuration file at `~/.config/hamalert/config.toml` with your HamAlert credentials:
+Run the managed login flow:
+
+```bash
+hamalert-cli auth login
+```
+
+The command validates your HamAlert credentials, stores your password in the OS keyring when available, and writes your username to `~/.config/hamalert/config.toml`.
+
+Preferred config:
+
+```toml
+username = "your_username"
+```
+
+On systems without a usable keyring backend, such as some headless Linux or SSH environments, hamalert-cli falls back to a legacy plaintext password in the config file:
 
 ```toml
 username = "your_username"
@@ -47,6 +61,50 @@ hamalert-cli --config-file /path/to/config.toml <command>
 ```
 
 ## Commands
+
+### auth
+
+Manage stored HamAlert credentials.
+
+#### auth login
+
+Validate and store credentials:
+
+```bash
+hamalert-cli auth login
+```
+
+Interactive login prompts for a username and password. If the config file already has a username, it is used as the prompt default. After successful validation, the password is stored in the OS keyring when available. If keyring storage succeeds, any plaintext `password` is removed from the active config file.
+
+Non-interactive login is also supported:
+
+```bash
+printf '%s\n' "$HAMALERT_PASSWORD" | hamalert-cli auth login --username N0CALL --password-stdin
+hamalert-cli auth login --username N0CALL --password-env HAMALERT_PASSWORD
+hamalert-cli auth login --username N0CALL --password "your_password"
+```
+
+Prefer `--password-stdin` or `--password-env` for scripts. `--password` is convenient but can expose the password through shell history or process inspection.
+
+#### auth status
+
+Show credential storage status and verify the resolved credentials against HamAlert:
+
+```bash
+hamalert-cli auth status
+```
+
+The status output reports the config path, username state, keyring availability, whether keyring/config passwords exist, which credential source would be used, and whether HamAlert login succeeds. It never prints password values.
+
+#### auth logout
+
+Remove locally stored credentials:
+
+```bash
+hamalert-cli auth logout
+```
+
+This deletes the keyring password when present and removes any plaintext `password` fallback from the active config file. The configured username is kept. There is no persistent HamAlert server session to revoke.
 
 ### add-trigger
 
