@@ -1,20 +1,110 @@
 use chrono::Local;
-use clap::{Parser, Subcommand, ValueEnum};
-use inquire::{InquireError, MultiSelect};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use inquire::{InquireError, MultiSelect, Password, Text};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::error::Error;
+use std::fmt;
 use std::fs;
-use std::path::PathBuf;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 
-#[derive(Deserialize)]
+const KEYRING_SERVICE: &str = "hamalert-cli";
+
+#[derive(Deserialize, Serialize, Default)]
 struct Config {
-    username: String,
-    password: String,
+    username: Option<String>,
+    password: Option<String>,
 }
 
-#[derive(Parser)]
+#[derive(Debug)]
+enum PasswordStoreError {
+    Unavailable(String),
+    Unexpected(String),
+}
+
+impl fmt::Display for PasswordStoreError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PasswordStoreError::Unavailable(message) => {
+                write!(f, "Password store unavailable: {}", message)
+            }
+            PasswordStoreError::Unexpected(message) => {
+                write!(f, "Password store error: {}", message)
+            }
+        }
+    }
+}
+
+impl Error for PasswordStoreError {}
+
+type PasswordStoreResult<T> = Result<T, PasswordStoreError>;
+
+trait PasswordStore {
+    fn get_password(&self, username: &str) -> PasswordStoreResult<Option<String>>;
+    fn set_password(&self, username: &str, password: &str) -> PasswordStoreResult<()>;
+    fn delete_password(&self, username: &str) -> PasswordStoreResult<()>;
+    fn is_available(&self) -> bool;
+}
+
+struct KeyringPasswordStore;
+
+impl KeyringPasswordStore {
+    fn entry(username: &str) -> PasswordStoreResult<keyring::Entry> {
+        keyring::Entry::new(KEYRING_SERVICE, username).map_err(map_keyring_error)
+    }
+}
+
+impl PasswordStore for KeyringPasswordStore {
+    fn get_password(&self, username: &str) -> PasswordStoreResult<Option<String>> {
+        match Self::entry(username)?.get_password() {
+            Ok(password) => Ok(Some(password)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(error) => Err(map_keyring_error(error)),
+        }
+    }
+
+    fn set_password(&self, username: &str, password: &str) -> PasswordStoreResult<()> {
+        Self::entry(username)?
+            .set_password(password)
+            .map_err(map_keyring_error)
+    }
+
+    fn delete_password(&self, username: &str) -> PasswordStoreResult<()> {
+        match Self::entry(username)?.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(error) => Err(map_keyring_error(error)),
+        }
+    }
+
+    fn is_available(&self) -> bool {
+        Self::entry("__availability_check__").is_ok()
+    }
+}
+
+fn map_keyring_error(error: keyring::Error) -> PasswordStoreError {
+    match error {
+        keyring::Error::NoDefaultStore
+        | keyring::Error::NoStorageAccess(_)
+        | keyring::Error::PlatformFailure(_) => PasswordStoreError::Unavailable(error.to_string()),
+        error => PasswordStoreError::Unexpected(error.to_string()),
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum CredentialSource {
+    Keyring,
+    ConfigFallback,
+}
+
+struct ResolvedCredentials {
+    username: String,
+    password: String,
+    source: CredentialSource,
+}
+
+#[derive(Debug, Parser)]
 #[command(name = "hamalert-cli")]
 #[command(about = "CLI for HamAlert API", long_about = None)]
 struct Cli {
@@ -26,7 +116,7 @@ struct Cli {
 }
 
 /// Shared options for trigger creation
-#[derive(Parser, Clone)]
+#[derive(Debug, Parser, Clone)]
 struct TriggerOptions {
     #[arg(long)]
     comment: String,
@@ -49,7 +139,7 @@ struct TriggerOptions {
 }
 
 /// Shared options for import commands
-#[derive(Parser, Clone)]
+#[derive(Debug, Parser, Clone)]
 struct ImportOptions {
     #[command(flatten)]
     trigger: TriggerOptions,
@@ -59,8 +149,11 @@ struct ImportOptions {
     dry_run: bool,
 }
 
-#[derive(Subcommand)]
+#[derive(Debug, Subcommand)]
 enum Commands {
+    /// Configure stored HamAlert credentials
+    #[command(subcommand)]
+    Auth(AuthCommands),
     /// Add a trigger for one or more callsigns
     AddTrigger {
         #[arg(long)]
@@ -116,7 +209,46 @@ enum Commands {
     Profile(ProfileCommands),
 }
 
-#[derive(Subcommand)]
+#[derive(Debug, Subcommand)]
+enum AuthCommands {
+    /// Validate and store HamAlert credentials
+    Login {
+        #[arg(long)]
+        username: Option<String>,
+
+        #[command(flatten)]
+        password: PasswordInput,
+    },
+    /// Show credential configuration status
+    Status,
+    /// Remove stored password while keeping configured username
+    Logout,
+}
+
+#[derive(Args)]
+#[group(multiple = false)]
+struct PasswordInput {
+    #[arg(long)]
+    password_stdin: bool,
+
+    #[arg(long)]
+    password_env: Option<String>,
+
+    #[arg(long)]
+    password: Option<String>,
+}
+
+impl fmt::Debug for PasswordInput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PasswordInput")
+            .field("password_stdin", &self.password_stdin)
+            .field("password_env", &self.password_env)
+            .field("password", &self.password.as_ref().map(|_| "[redacted]"))
+            .finish()
+    }
+}
+
+#[derive(Debug, Subcommand)]
 enum ProfileCommands {
     /// List all available profiles
     List,
@@ -158,7 +290,7 @@ enum ProfileCommands {
     ShowPermanent,
 }
 
-#[derive(Clone, ValueEnum)]
+#[derive(Debug, Clone, ValueEnum)]
 enum Action {
     Url,
     App,
@@ -166,7 +298,7 @@ enum Action {
     Telnet,
 }
 
-#[derive(Clone, ValueEnum)]
+#[derive(Debug, Clone, ValueEnum)]
 #[allow(clippy::upper_case_acronyms)]
 enum Mode {
     CW,
@@ -414,18 +546,27 @@ fn find_unexpected_triggers(
         .collect()
 }
 
-fn load_config(config_file: Option<PathBuf>) -> Result<Config, Box<dyn Error>> {
-    let config_path = if let Some(path) = config_file {
-        path
-    } else {
-        // Use XDG_CONFIG_HOME or default to ~/.config
-        let config_dir = dirs::config_dir()
-            .ok_or("Could not determine config directory")?
-            .join("hamalert");
-        config_dir.join("config.toml")
-    };
+fn default_config_path() -> Result<PathBuf, Box<dyn Error>> {
+    Ok(dirs::config_dir()
+        .ok_or("Could not determine config directory")?
+        .join("hamalert")
+        .join("config.toml"))
+}
 
-    let config_content = fs::read_to_string(&config_path).map_err(|e| {
+fn config_path(config_file: Option<PathBuf>) -> Result<PathBuf, Box<dyn Error>> {
+    Ok(match config_file {
+        Some(path) => path,
+        None => default_config_path()?,
+    })
+}
+
+fn load_config(config_file: Option<PathBuf>) -> Result<Config, Box<dyn Error>> {
+    let config_path = config_path(config_file)?;
+    load_config_from_path(&config_path)
+}
+
+fn load_config_from_path(config_path: &Path) -> Result<Config, Box<dyn Error>> {
+    let config_content = fs::read_to_string(config_path).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             format!(
                 "Config file not found at: {}\n\n\
@@ -449,6 +590,138 @@ fn load_config(config_file: Option<PathBuf>) -> Result<Config, Box<dyn Error>> {
     Ok(config)
 }
 
+fn load_config_or_default(config_path: &Path) -> Result<Config, Box<dyn Error>> {
+    match load_config_from_path(config_path) {
+        Ok(config) => Ok(config),
+        Err(error) => {
+            if !config_path.exists() {
+                Ok(Config::default())
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
+fn save_config(config_path: &Path, config: &Config) -> Result<(), Box<dyn Error>> {
+    if let Some(parent) = config_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    write_config_file(config_path, toml::to_string(config)?.as_bytes())?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn write_config_file(config_path: &Path, contents: &[u8]) -> Result<(), Box<dyn Error>> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(config_path)?;
+    file.write_all(contents)?;
+    fs::set_permissions(config_path, fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_config_file(config_path: &Path, contents: &[u8]) -> Result<(), Box<dyn Error>> {
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(config_path)?;
+    file.write_all(contents)?;
+    Ok(())
+}
+
+fn password_from_input(
+    input: &PasswordInput,
+    stdin_content: &str,
+) -> Result<Option<String>, Box<dyn Error>> {
+    if input.password_stdin {
+        Ok(Some(
+            stdin_content.trim_end_matches(['\r', '\n']).to_string(),
+        ))
+    } else if let Some(var) = &input.password_env {
+        Ok(Some(std::env::var(var).map_err(|_| {
+            format!("Environment variable {} is not set", var)
+        })?))
+    } else {
+        Ok(input.password.clone())
+    }
+}
+
+fn non_interactive_login_credentials(
+    config: &Config,
+    username_arg: Option<String>,
+    supplied_password: Option<String>,
+) -> Option<(String, String)> {
+    let username = username_arg.or_else(|| config.username.clone())?;
+    let password = supplied_password?;
+    Some((username, password))
+}
+
+fn remove_config_password_for_logout(config: &mut Config) -> bool {
+    let had_password = config.password.take().is_some();
+    had_password || config.username.is_some()
+}
+
+fn require_username(config: &Config) -> Result<String, Box<dyn Error>> {
+    config.username.clone().ok_or_else(|| {
+        "Config is missing username. Run `hamalert-cli auth login` to configure credentials."
+            .to_string()
+            .into()
+    })
+}
+
+fn missing_password_error(username: &str) -> Box<dyn Error> {
+    format!(
+        "No password found for {}. Run `hamalert-cli auth login` to store credentials.",
+        username
+    )
+    .into()
+}
+
+fn config_fallback_credentials(
+    username: &str,
+    password: &Option<String>,
+) -> Option<ResolvedCredentials> {
+    password.as_ref().map(|password| ResolvedCredentials {
+        username: username.to_string(),
+        password: password.clone(),
+        source: CredentialSource::ConfigFallback,
+    })
+}
+
+fn resolve_credentials(
+    config: &Config,
+    password_store: &dyn PasswordStore,
+) -> Result<ResolvedCredentials, Box<dyn Error>> {
+    let username = require_username(config)?;
+
+    match password_store.get_password(&username) {
+        Ok(Some(password)) => Ok(ResolvedCredentials {
+            username,
+            password,
+            source: CredentialSource::Keyring,
+        }),
+        Ok(None) | Err(PasswordStoreError::Unavailable(_)) => {
+            config_fallback_credentials(&username, &config.password)
+                .ok_or_else(|| missing_password_error(&username))
+        }
+        Err(error @ PasswordStoreError::Unexpected(_)) => {
+            if let Some(credentials) = config_fallback_credentials(&username, &config.password) {
+                Ok(credentials)
+            } else {
+                Err(error.into())
+            }
+        }
+    }
+}
+
 async fn login(client: &Client, username: &str, password: &str) -> Result<(), Box<dyn Error>> {
     let params = [("username", username), ("password", password)];
 
@@ -460,11 +733,18 @@ async fn login(client: &Client, username: &str, password: &str) -> Result<(), Bo
 
     println!("Login status: {}", response.status());
 
-    if !response.status().is_success() {
+    let status = response.status();
+    let body = response.text().await?;
+
+    if !status.is_success() || login_body_indicates_invalid_credentials(&body) {
         return Err("Login failed".into());
     }
 
     Ok(())
+}
+
+fn login_body_indicates_invalid_credentials(body: &str) -> bool {
+    body.contains("Login failed; please check username and password")
 }
 
 /// Parse Ham2K PoLo callsign notes content and extract callsigns.
@@ -763,9 +1043,194 @@ async fn import_callsigns(
     Ok(())
 }
 
+async fn handle_auth_command(
+    command: AuthCommands,
+    config_path: &Path,
+    mut config: Config,
+    password_store: &dyn PasswordStore,
+    client: &Client,
+) -> Result<(), Box<dyn Error>> {
+    match command {
+        AuthCommands::Login { username, password } => {
+            auth_login(
+                config_path,
+                &mut config,
+                username,
+                &password,
+                password_store,
+                client,
+            )
+            .await
+        }
+        AuthCommands::Status => auth_status(config_path, &config, password_store, client).await,
+        AuthCommands::Logout => auth_logout(config_path, &mut config, password_store),
+    }
+}
+
+async fn auth_login(
+    config_path: &Path,
+    config: &mut Config,
+    username_arg: Option<String>,
+    password_input: &PasswordInput,
+    password_store: &dyn PasswordStore,
+    client: &Client,
+) -> Result<(), Box<dyn Error>> {
+    let mut stdin_content = String::new();
+    if password_input.password_stdin {
+        std::io::stdin().read_to_string(&mut stdin_content)?;
+    }
+
+    let supplied_password = password_from_input(password_input, &stdin_content)?;
+
+    let (username, password) = if let Some((username, password)) =
+        non_interactive_login_credentials(config, username_arg.clone(), supplied_password.clone())
+    {
+        login(client, &username, &password).await?;
+        (username, password)
+    } else {
+        let mut last_error: Option<Box<dyn Error>> = None;
+        let mut successful_credentials = None;
+
+        for attempt in 1..=3 {
+            let username = prompt_username(username_arg.as_deref().or(config.username.as_deref()))?;
+            let password = match &supplied_password {
+                Some(password) => password.clone(),
+                None => Password::new("HamAlert password")
+                    .without_confirmation()
+                    .prompt()?,
+            };
+
+            match login(client, &username, &password).await {
+                Ok(()) => {
+                    successful_credentials = Some((username, password));
+                    break;
+                }
+                Err(error) => {
+                    last_error = Some(error);
+                    if attempt < 3 {
+                        println!("Login failed. Please try again.");
+                    }
+                }
+            }
+        }
+
+        successful_credentials.ok_or_else(|| last_error.unwrap_or_else(|| "Login failed".into()))?
+    };
+
+    config.username = Some(username.clone());
+    match password_store.set_password(&username, &password) {
+        Ok(()) => {
+            config.password = None;
+            save_config(config_path, config)?;
+            println!("Stored HamAlert credentials in the system keyring.");
+        }
+        Err(PasswordStoreError::Unavailable(message)) => {
+            config.password = Some(password);
+            save_config(config_path, config)?;
+            println!(
+                "Warning: keyring unavailable ({}). Stored password in config fallback.",
+                message
+            );
+        }
+        Err(error @ PasswordStoreError::Unexpected(_)) => return Err(error.into()),
+    }
+
+    Ok(())
+}
+
+fn prompt_username(default: Option<&str>) -> Result<String, Box<dyn Error>> {
+    let mut prompt = Text::new("HamAlert username");
+    if let Some(default) = default {
+        prompt = prompt.with_initial_value(default);
+    }
+    Ok(prompt.prompt()?)
+}
+
+async fn auth_status(
+    config_path: &Path,
+    config: &Config,
+    password_store: &dyn PasswordStore,
+    client: &Client,
+) -> Result<(), Box<dyn Error>> {
+    println!("Config path: {}", config_path.display());
+    println!(
+        "Username: {}",
+        config.username.as_deref().unwrap_or("(not configured)")
+    );
+    println!("Keyring available: {}", password_store.is_available());
+
+    let mut keyring_presence = "not checked".to_string();
+    if let Some(username) = &config.username {
+        keyring_presence = match password_store.get_password(username) {
+            Ok(Some(_)) => "present".to_string(),
+            Ok(None) => "missing".to_string(),
+            Err(PasswordStoreError::Unavailable(message)) => format!("unavailable ({})", message),
+            Err(PasswordStoreError::Unexpected(message)) => format!("error ({})", message),
+        };
+    }
+    println!("Keyring password: {}", keyring_presence);
+    println!(
+        "Config fallback password: {}",
+        if config.password.is_some() {
+            "present"
+        } else {
+            "missing"
+        }
+    );
+
+    match resolve_credentials(config, password_store) {
+        Ok(credentials) => {
+            let source = match credentials.source {
+                CredentialSource::Keyring => "keyring",
+                CredentialSource::ConfigFallback => "config fallback",
+            };
+            println!("Credential source: {}", source);
+            match login(client, &credentials.username, &credentials.password).await {
+                Ok(()) => println!("HamAlert login: success"),
+                Err(error) => println!("HamAlert login: failed ({})", error),
+            }
+        }
+        Err(error) => {
+            println!("Credential source: unavailable ({})", error);
+            println!("HamAlert login: not attempted");
+        }
+    }
+
+    Ok(())
+}
+
+fn auth_logout(
+    config_path: &Path,
+    config: &mut Config,
+    password_store: &dyn PasswordStore,
+) -> Result<(), Box<dyn Error>> {
+    if let Some(username) = &config.username {
+        match password_store.delete_password(username) {
+            Ok(()) | Err(PasswordStoreError::Unavailable(_)) => {}
+            Err(error @ PasswordStoreError::Unexpected(_)) => return Err(error.into()),
+        }
+    }
+
+    if remove_config_password_for_logout(config) {
+        save_config(config_path, config)?;
+        println!("Removed stored HamAlert password. Username was kept.");
+    } else {
+        println!("No configured HamAlert credentials found.");
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
+    let config_path = config_path(cli.config_file.clone())?;
+    let password_store = KeyringPasswordStore;
+
+    if let Commands::Auth(command) = cli.command {
+        let config = load_config_or_default(&config_path)?;
+        let client = Client::builder().cookie_store(true).build()?;
+        return handle_auth_command(command, &config_path, config, &password_store, &client).await;
+    }
 
     // Load config from file
     let config = load_config(cli.config_file)?;
@@ -774,10 +1239,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let client = Client::builder().cookie_store(true).build()?;
 
     // Login first
-    login(&client, &config.username, &config.password).await?;
+    let credentials = resolve_credentials(&config, &password_store)?;
+    login(&client, &credentials.username, &credentials.password).await?;
 
     // Execute the subcommand
     match cli.command {
+        Commands::Auth(_) => unreachable!("auth commands are handled before login"),
         Commands::AddTrigger { callsign, options } => {
             let action_strings: Vec<String> = options
                 .actions
@@ -1754,6 +2221,288 @@ async fn main() -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::error::ErrorKind;
+
+    struct FakePasswordStore {
+        result: PasswordStoreResult<Option<String>>,
+    }
+
+    impl FakePasswordStore {
+        fn with_password(password: &str) -> Self {
+            Self {
+                result: Ok(Some(password.to_string())),
+            }
+        }
+
+        fn missing() -> Self {
+            Self { result: Ok(None) }
+        }
+
+        fn unavailable(message: &str) -> Self {
+            Self {
+                result: Err(PasswordStoreError::Unavailable(message.to_string())),
+            }
+        }
+    }
+
+    impl PasswordStore for FakePasswordStore {
+        fn get_password(&self, _username: &str) -> PasswordStoreResult<Option<String>> {
+            match &self.result {
+                Ok(password) => Ok(password.clone()),
+                Err(PasswordStoreError::Unavailable(message)) => {
+                    Err(PasswordStoreError::Unavailable(message.clone()))
+                }
+                Err(PasswordStoreError::Unexpected(message)) => {
+                    Err(PasswordStoreError::Unexpected(message.clone()))
+                }
+            }
+        }
+
+        fn set_password(&self, _username: &str, _password: &str) -> PasswordStoreResult<()> {
+            Ok(())
+        }
+
+        fn delete_password(&self, _username: &str) -> PasswordStoreResult<()> {
+            Ok(())
+        }
+
+        fn is_available(&self) -> bool {
+            !matches!(self.result, Err(PasswordStoreError::Unavailable(_)))
+        }
+    }
+
+    #[test]
+    fn test_resolve_credentials_prefers_keyring() {
+        let config = Config {
+            username: Some("N0CALL".to_string()),
+            password: Some("config-secret".to_string()),
+        };
+        let store = FakePasswordStore::with_password("keyring-secret");
+        let password_store: &dyn PasswordStore = &store;
+
+        assert!(password_store.is_available());
+        password_store.set_password("N0CALL", "unused").unwrap();
+        password_store.delete_password("N0CALL").unwrap();
+
+        let credentials = resolve_credentials(&config, password_store).unwrap();
+
+        assert_eq!(credentials.username, "N0CALL");
+        assert_eq!(credentials.password, "keyring-secret");
+        assert_eq!(credentials.source, CredentialSource::Keyring);
+    }
+
+    #[test]
+    fn test_resolve_credentials_falls_back_when_keyring_missing() {
+        let config = Config {
+            username: Some("N0CALL".to_string()),
+            password: Some("config-secret".to_string()),
+        };
+        let store = FakePasswordStore::missing();
+
+        let credentials = resolve_credentials(&config, &store).unwrap();
+
+        assert_eq!(credentials.username, "N0CALL");
+        assert_eq!(credentials.password, "config-secret");
+        assert_eq!(credentials.source, CredentialSource::ConfigFallback);
+    }
+
+    #[test]
+    fn test_resolve_credentials_falls_back_when_keyring_unavailable() {
+        let config = Config {
+            username: Some("N0CALL".to_string()),
+            password: Some("config-secret".to_string()),
+        };
+        let store = FakePasswordStore::unavailable("no store");
+
+        let credentials = resolve_credentials(&config, &store).unwrap();
+
+        assert_eq!(credentials.username, "N0CALL");
+        assert_eq!(credentials.password, "config-secret");
+        assert_eq!(credentials.source, CredentialSource::ConfigFallback);
+    }
+
+    #[test]
+    fn test_resolve_credentials_errors_without_password() {
+        let config = Config {
+            username: Some("N0CALL".to_string()),
+            password: None,
+        };
+        let store = FakePasswordStore::missing();
+
+        let error = match resolve_credentials(&config, &store) {
+            Ok(_) => panic!("expected missing password error"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("No password found"));
+        assert!(error.to_string().contains("hamalert-cli auth login"));
+    }
+
+    #[test]
+    fn test_login_body_indicates_invalid_credentials() {
+        let body = r#"
+            <div class="alert alert-danger" role="alert">
+                Login failed; please check username and password.
+            </div>
+        "#;
+
+        assert!(login_body_indicates_invalid_credentials(body));
+    }
+
+    #[test]
+    fn test_keyring_storage_access_error_is_unavailable() {
+        let error = keyring::Error::NoStorageAccess(Box::new(std::io::Error::other("locked")));
+
+        let mapped = map_keyring_error(error);
+
+        assert!(matches!(mapped, PasswordStoreError::Unavailable(_)));
+    }
+
+    #[test]
+    fn test_config_accepts_username_only() {
+        let config: Config = toml::from_str("username = \"N0CALL\"\n").unwrap();
+        assert_eq!(config.username.as_deref(), Some("N0CALL"));
+        assert!(config.password.is_none());
+    }
+
+    #[test]
+    fn test_config_accepts_legacy_password() {
+        let config: Config =
+            toml::from_str("username = \"N0CALL\"\npassword = \"secret\"\n").unwrap();
+        assert_eq!(config.username.as_deref(), Some("N0CALL"));
+        assert_eq!(config.password.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn test_auth_login_accepts_password_stdin() {
+        let cli = Cli::try_parse_from([
+            "hamalert-cli",
+            "auth",
+            "login",
+            "--username",
+            "N0CALL",
+            "--password-stdin",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Auth(AuthCommands::Login { username, password }) => {
+                assert_eq!(username.as_deref(), Some("N0CALL"));
+                assert!(password.password_stdin);
+                assert!(password.password_env.is_none());
+                assert!(password.password.is_none());
+            }
+            _ => panic!("expected auth login command"),
+        }
+    }
+
+    #[test]
+    fn test_auth_login_rejects_multiple_password_sources() {
+        let error = Cli::try_parse_from([
+            "hamalert-cli",
+            "auth",
+            "login",
+            "--password-stdin",
+            "--password",
+            "secret",
+        ])
+        .unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn test_auth_logout_parses() {
+        let cli = Cli::try_parse_from(["hamalert-cli", "auth", "logout"]).unwrap();
+
+        match cli.command {
+            Commands::Auth(AuthCommands::Logout) => {}
+            _ => panic!("expected auth logout command"),
+        }
+    }
+
+    #[test]
+    fn test_password_input_from_env() {
+        unsafe {
+            std::env::set_var("HAMALERT_TEST_PASSWORD", "env-secret");
+        }
+
+        let input = PasswordInput {
+            password_stdin: false,
+            password_env: Some("HAMALERT_TEST_PASSWORD".to_string()),
+            password: None,
+        };
+
+        let password = password_from_input(&input, "").unwrap();
+
+        unsafe {
+            std::env::remove_var("HAMALERT_TEST_PASSWORD");
+        }
+
+        assert_eq!(password.as_deref(), Some("env-secret"));
+    }
+
+    #[test]
+    fn test_password_input_from_flag() {
+        let input = PasswordInput {
+            password_stdin: false,
+            password_env: None,
+            password: Some("flag-secret".to_string()),
+        };
+
+        let password = password_from_input(&input, "").unwrap();
+
+        assert_eq!(password.as_deref(), Some("flag-secret"));
+    }
+
+    #[test]
+    fn test_auth_login_uses_config_username_for_supplied_password() {
+        let config = Config {
+            username: Some("N0CALL".to_string()),
+            password: None,
+        };
+
+        let credentials =
+            non_interactive_login_credentials(&config, None, Some("flag-secret".to_string()))
+                .unwrap();
+
+        assert_eq!(credentials.0, "N0CALL");
+        assert_eq!(credentials.1, "flag-secret");
+    }
+
+    #[test]
+    fn test_auth_logout_default_config_is_noop() {
+        let mut config = Config::default();
+
+        assert!(!remove_config_password_for_logout(&mut config));
+        assert!(config.username.is_none());
+        assert!(config.password.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_save_config_writes_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = std::env::temp_dir().join(format!(
+            "hamalert-cli-test-config-{}-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let config = Config {
+            username: Some("N0CALL".to_string()),
+            password: Some("secret".to_string()),
+        };
+
+        save_config(&path, &config).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        fs::remove_file(&path).unwrap();
+
+        assert_eq!(mode, 0o600);
+    }
 
     #[test]
     fn test_parse_polo_notes_simple_callsigns() {
