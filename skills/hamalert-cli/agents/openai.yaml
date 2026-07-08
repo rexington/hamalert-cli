@@ -1,0 +1,4 @@
+interface:
+  display_name: "HamAlert CLI"
+  short_description: "Operate HamAlert triggers safely"
+  default_prompt: "Use $hamalert-cli to manage HamAlert triggers safely."
