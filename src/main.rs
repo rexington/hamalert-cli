@@ -513,6 +513,10 @@ fn calculate_profile_match(current: &[StoredTrigger], profile: &[StoredTrigger])
     (matched, profile.len())
 }
 
+fn profile_match_percentage(matched: usize, total: usize) -> usize {
+    (matched * 100).checked_div(total).unwrap_or(100)
+}
+
 /// Filter out permanent triggers from a list
 #[allow(dead_code)]
 fn filter_out_permanent(
@@ -1603,11 +1607,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     let profile = load_profile(profile_name).unwrap_or_default();
                     let (matched, total) =
                         calculate_profile_match(&current_non_permanent, &profile);
-                    let percentage = if total > 0 {
-                        (matched * 100) / total
-                    } else {
-                        100
-                    };
+                    let percentage = profile_match_percentage(matched, total);
 
                     let is_current = current_profile.as_ref() == Some(profile_name);
                     let marker = if is_current { "*" } else { " " };
@@ -1708,11 +1708,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     let profile = load_profile(profile_name).unwrap_or_default();
                     let (matched, total) =
                         calculate_profile_match(&current_non_permanent, &profile);
-                    let percentage = if total > 0 {
-                        (matched * 100) / total
-                    } else {
-                        100
-                    };
+                    let percentage = profile_match_percentage(matched, total);
 
                     let marker = if matched == total && total > 0 {
                         " <- best match"
@@ -2736,5 +2732,16 @@ mod tests {
         let (matched, total) = calculate_profile_match(&current, &profile);
         assert_eq!(matched, 1);
         assert_eq!(total, 2);
+    }
+
+    #[test]
+    fn test_profile_match_percentage() {
+        assert_eq!(profile_match_percentage(1, 2), 50);
+        assert_eq!(profile_match_percentage(2, 2), 100);
+    }
+
+    #[test]
+    fn test_profile_match_percentage_defaults_to_full_match_for_empty_profile() {
+        assert_eq!(profile_match_percentage(0, 0), 100);
     }
 }
