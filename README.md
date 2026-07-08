@@ -29,6 +29,14 @@ Optionally, install it to your PATH:
 cargo install --path .
 ```
 
+### Agent Skill
+
+This repository includes an agent skill for using the CLI safely:
+
+```bash
+npx skills add jsvana/hamalert-cli
+```
+
 ## Configuration
 
 Run the managed login flow:
